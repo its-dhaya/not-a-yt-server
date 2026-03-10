@@ -1,15 +1,92 @@
+require("dotenv").config();
+
 const express = require("express");
 const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
 const { randomUUID } = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// SECURITY: only allow requests from the deployed frontend
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "1mb" }));
+
+/* -------------------------
+   SUPABASE ADMIN CLIENT
+   Uses service role key — never exposed to frontend
+------------------------- */
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+/* -------------------------
+   AUTH MIDDLEWARE
+   SECURITY #2: verify Supabase JWT on every protected request
+   Fetches the user's API keys from Supabase so frontend never needs to send them
+------------------------- */
+
+const requireAuth = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .json({ error: "Missing or invalid Authorization header" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    // Verify JWT with Supabase
+    const {
+      data: { user },
+      error: authError,
+    } = await supabaseAdmin.auth.getUser(token);
+
+    if (authError || !user) {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
+
+    // Fetch this user's API keys from Supabase server-side
+    // SECURITY #1: keys never travel from browser to server
+    const { data: keys, error: keysError } = await supabaseAdmin
+      .from("api_keys")
+      .select("groq_key, pexels_key, pixabay_key")
+      .eq("user_id", user.id)
+      .single();
+
+    if (keysError || !keys) {
+      return res
+        .status(403)
+        .json({ error: "API keys not found. Please set up your keys first." });
+    }
+
+    req.user = user;
+    req.apiKeys = {
+      groqKey: keys.groq_key,
+      pexelsKey: keys.pexels_key,
+      pixabayKey: keys.pixabay_key,
+    };
+
+    next();
+  } catch (err) {
+    console.error("Auth middleware error:", err);
+    res.status(500).json({ error: "Authentication failed" });
+  }
+};
 
 /* -------------------------
    PROGRESS UPDATES (SSE)
@@ -40,9 +117,21 @@ function sendProgress(step, percent) {
    GENERATE SCRIPT
 ------------------------- */
 
-app.post("/generate-script", async (req, res) => {
+app.post("/generate-script", requireAuth, async (req, res) => {
   try {
-    const { topic, groqKey } = req.body;
+    // SECURITY #1: keys come from server-side Supabase, not request body
+    const { topic: rawTopic } = req.body;
+    const { groqKey } = req.apiKeys;
+
+    // SECURITY #3: sanitize topic — strip shell metacharacters
+    const topic = rawTopic
+      .replace(/[`$|;&<>(){}[\]\\"']/g, "")
+      .trim()
+      .slice(0, 200);
+
+    if (!topic) {
+      return res.status(400).json({ error: "Invalid topic" });
+    }
 
     const response = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
@@ -95,9 +184,11 @@ app.post("/generate-script", async (req, res) => {
    GET CLIPS
 ------------------------- */
 
-app.post("/get-clips", async (req, res) => {
+app.post("/get-clips", requireAuth, async (req, res) => {
   try {
-    const { script, keywords, pexelsKey, pixabayKey } = req.body;
+    // SECURITY #1: keys from server-side auth middleware
+    const { script, keywords } = req.body;
+    const { pexelsKey, pixabayKey } = req.apiKeys;
 
     const scenes = await Promise.all(
       keywords.filter(Boolean).map(async (keyword, i) => {
@@ -202,7 +293,7 @@ app.post("/get-clips", async (req, res) => {
    so concurrent renders never conflict
 ------------------------- */
 
-app.post("/generate-video", async (req, res) => {
+app.post("/generate-video", requireAuth, async (req, res) => {
   // FIX #6: unique directory per render job
   const jobId = randomUUID();
   const jobDir = path.join("jobs", jobId);
@@ -210,6 +301,20 @@ app.post("/generate-video", async (req, res) => {
 
   try {
     const { script, videoUrls } = req.body;
+
+    // SECURITY: validate inputs
+    if (
+      !Array.isArray(videoUrls) ||
+      videoUrls.length === 0 ||
+      videoUrls.length > 20
+    ) {
+      return res.status(400).json({ error: "Invalid videoUrls" });
+    }
+    if (!Array.isArray(script) || script.length !== videoUrls.length) {
+      return res
+        .status(400)
+        .json({ error: "script and videoUrls length must match" });
+    }
 
     const scriptPath = path.join(jobDir, "script.txt");
     const voicePath = path.join(jobDir, "voice.mp3");
