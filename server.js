@@ -7,10 +7,15 @@ const path = require("path");
 const cors = require("cors");
 const { randomUUID } = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const app = express();
+
+// SECURITY #6: helmet sets secure HTTP headers in one line
+app.use(helmet());
 
 // SECURITY: only allow requests from the deployed frontend
 app.use(
@@ -21,6 +26,40 @@ app.use(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+/* -------------------------
+   RATE LIMITING
+   SECURITY #4: prevent API quota abuse
+------------------------- */
+
+// General API limit — 60 requests per minute per IP
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { error: "Too many requests, please slow down." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Render limit — max 5 video renders per hour per IP
+const renderLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: { error: "Render limit reached. Max 5 videos per hour." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Script generation limit — max 20 per hour per IP
+const scriptLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: { error: "Script limit reached. Max 20 scripts per hour." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(generalLimiter);
 
 /* -------------------------
    SUPABASE ADMIN CLIENT
@@ -117,7 +156,7 @@ function sendProgress(step, percent) {
    GENERATE SCRIPT
 ------------------------- */
 
-app.post("/generate-script", requireAuth, async (req, res) => {
+app.post("/generate-script", scriptLimiter, requireAuth, async (req, res) => {
   try {
     // SECURITY #1: keys come from server-side Supabase, not request body
     const { topic: rawTopic } = req.body;
@@ -293,7 +332,7 @@ app.post("/get-clips", requireAuth, async (req, res) => {
    so concurrent renders never conflict
 ------------------------- */
 
-app.post("/generate-video", requireAuth, async (req, res) => {
+app.post("/generate-video", renderLimiter, requireAuth, async (req, res) => {
   // FIX #6: unique directory per render job
   const jobId = randomUUID();
   const jobDir = path.join("jobs", jobId);
@@ -302,19 +341,39 @@ app.post("/generate-video", requireAuth, async (req, res) => {
   try {
     const { script, videoUrls } = req.body;
 
-    // SECURITY: validate inputs
+    // SECURITY #5: validate all inputs before touching the filesystem
     if (
       !Array.isArray(videoUrls) ||
       videoUrls.length === 0 ||
       videoUrls.length > 20
     ) {
-      return res.status(400).json({ error: "Invalid videoUrls" });
+      return res
+        .status(400)
+        .json({ error: "Invalid videoUrls: must be array of 1-20 items" });
     }
     if (!Array.isArray(script) || script.length !== videoUrls.length) {
       return res
         .status(400)
         .json({ error: "script and videoUrls length must match" });
     }
+
+    const urlPattern = /^https?:\/\/.+/;
+    const allValidUrls = videoUrls.every(
+      (u) => typeof u === "string" && urlPattern.test(u)
+    );
+    if (!allValidUrls) {
+      return res
+        .status(400)
+        .json({ error: "Invalid videoUrls: all items must be valid URLs" });
+    }
+
+    // Sanitize script lines — strip any html/script tags
+    const safeScript = script.map((line) =>
+      String(line)
+        .replace(/<[^>]*>/g, "")
+        .trim()
+        .slice(0, 500)
+    );
 
     const scriptPath = path.join(jobDir, "script.txt");
     const voicePath = path.join(jobDir, "voice.mp3");
@@ -327,7 +386,7 @@ app.post("/generate-video", requireAuth, async (req, res) => {
     /* Step 1: TTS */
     sendProgress("Generating voiceover...", 10);
 
-    fs.writeFileSync(scriptPath, script.join(" "));
+    fs.writeFileSync(scriptPath, safeScript.join(" "));
 
     await runCommand(
       `python -m edge_tts --file "${scriptPath}" --voice en-US-JennyNeural --write-media "${voicePath}"`
