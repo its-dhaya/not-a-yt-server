@@ -347,6 +347,57 @@ app.post("/get-clips", requireAuth, async (req, res) => {
 });
 
 /* -------------------------
+   PREVIEW VOICE
+   Returns a short MP3 preview of the selected voice
+------------------------- */
+
+app.post("/preview-voice", async (req, res) => {
+  const { voice, text } = req.body;
+
+  const ALLOWED_VOICES = [
+    "en-US-JennyNeural",
+    "en-US-GuyNeural",
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural",
+    "en-AU-NatashaNeural",
+    "en-AU-WilliamNeural",
+    "en-IN-NeerjaNeural",
+    "en-IN-PrabhatNeural",
+  ];
+
+  if (!ALLOWED_VOICES.includes(voice)) {
+    return res.status(400).json({ error: "Invalid voice" });
+  }
+
+  const previewPath = `preview_${randomUUID()}.mp3`;
+
+  try {
+    const safeText = String(text || "Hello, this is a voice preview.")
+      .replace(/[`$|;&<>(){}[\]\\"']/g, "")
+      .slice(0, 200);
+
+    fs.writeFileSync(`${previewPath}.txt`, safeText);
+
+    await runCommand(
+      `python -m edge_tts --text "${safeText}" --voice ${voice} --write-media ${previewPath}`
+    );
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    const stream = fs.createReadStream(previewPath);
+    stream.pipe(res);
+    stream.on("end", () => {
+      fs.rmSync(previewPath, { force: true });
+      fs.rmSync(`${previewPath}.txt`, { force: true });
+    });
+  } catch (err) {
+    console.error("Preview error:", err);
+    fs.rmSync(previewPath, { force: true });
+    fs.rmSync(`${previewPath}.txt`, { force: true });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* -------------------------
    GENERATE VIDEO
    FIX #6: each render gets its own job directory
    so concurrent renders never conflict
@@ -359,7 +410,7 @@ app.post("/generate-video", renderLimiter, requireAuth, async (req, res) => {
   fs.mkdirSync(jobDir, { recursive: true });
 
   try {
-    const { script, videoUrls } = req.body;
+    const { script, videoUrls, voice } = req.body;
 
     // SECURITY #5: validate all inputs before touching the filesystem
     if (
@@ -408,8 +459,21 @@ app.post("/generate-video", renderLimiter, requireAuth, async (req, res) => {
 
     fs.writeFileSync(scriptPath, safeScript.join(" "));
 
+    const safeVoice = [
+      "en-US-JennyNeural",
+      "en-US-GuyNeural",
+      "en-GB-SoniaNeural",
+      "en-GB-RyanNeural",
+      "en-AU-NatashaNeural",
+      "en-AU-WilliamNeural",
+      "en-IN-NeerjaNeural",
+      "en-IN-PrabhatNeural",
+    ].includes(voice)
+      ? voice
+      : "en-US-JennyNeural";
+
     await runCommand(
-      `python -m edge_tts --file "${scriptPath}" --voice en-US-JennyNeural --write-media "${voicePath}"`
+      `python -m edge_tts --file "${scriptPath}" --voice ${safeVoice} --write-media "${voicePath}"`
     );
 
     /* Step 2: Audio duration */
