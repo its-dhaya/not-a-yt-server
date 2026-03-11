@@ -185,7 +185,27 @@ app.post("/generate-script", scriptLimiter, requireAuth, async (req, res) => {
           messages: [
             {
               role: "user",
-              content: `Create a 60 second YouTube Shorts facts video about ${topic}. IMPORTANT RULES: Do not wrap with json. Return ONLY RAW JSON. Use EXACTLY 10 scenes. Each scene must contain text and keyword (simple visual noun related to the sentence). Keyword must be visual, easy for stock videos, and 1-2 words only. If the sentence contains a famous place or named object, the keyword must be a combined phrase (1-2 words). Format: { "scenes": [ { "text": "...", "keyword": "word1 word2" } ] }`,
+              content: `Create a 60-second YouTube Shorts facts video about ${topic}.
+
+Return ONLY raw JSON. No markdown, no explanation, no code blocks.
+
+Use EXACTLY 10 scenes. Each scene has:
+- "text": one punchy fact sentence (max 20 words)
+- "keyword": a stock footage search term (1-3 words, must be a CONCRETE VISUAL noun or place)
+
+KEYWORD RULES (critical):
+- Must be something you can SEE in a video (object, animal, place, person, action)
+- Must be SPECIFIC not generic — use "great wall china" not "wall", "tiger hunting" not "animal"
+- NEVER use abstract words like: history, culture, concept, fact, world, people, ancient, modern, famous, interesting
+- If the sentence mentions a named landmark or place — use that exact name as keyword
+- If the sentence mentions an animal — use "animal + action" e.g. "elephant bathing"
+- If the sentence mentions a person — use their profession or a visual scene e.g. "astronaut space"
+- Think: what B-roll footage would a documentary editor pick for this sentence?
+
+BAD keywords: "history", "culture", "people", "ancient times", "world record"
+GOOD keywords: "great wall", "silk road camel", "yangtze river", "terracotta soldiers", "panda bamboo"
+
+Format: { "scenes": [ { "text": "...", "keyword": "..." } ] }`,
             },
           ],
         }),
